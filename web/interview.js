@@ -439,6 +439,7 @@ const state = {
   /// interviewer's own evaluation is missing from it.
   reportUnreadable: false,
   room: null,
+  startupCleanupRoom: null,
   connected: false,
   interviewerReadiness: null,
   /// The consent this interview is running under, `null` where the server
@@ -1419,6 +1420,7 @@ async function connect(preflight, presenting = false) {
     const joined = state.room;
     state.connected = false;
     state.room = null;
+    if (joined && error?.startup) state.startupCleanupRoom = joined;
     if (joined) void joined.disconnect?.()?.catch?.(() => {});
     stopPreflight(preflight);
     stopLocalMedia();
@@ -1552,6 +1554,8 @@ async function connectLiveKit(connection, preflight, presenting = false) {
     updateAgentState();
   });
   room.on(livekit.RoomEvent.Disconnected, () => {
+    const startupCleanup = state.startupCleanupRoom === room;
+    if (startupCleanup) state.startupCleanupRoom = null;
     state.interviewerReadiness?.fail();
     state.connected = false;
     // Terminal, not transient: LiveKit fires Reconnecting for a recoverable
@@ -1563,10 +1567,12 @@ async function connectLiveKit(connection, preflight, presenting = false) {
     // waiting on an overlay for a report that could not arrive.
     if (state.phase === "report_recovery") reportRecovery.finish();
     state.room = null;
-    setBanner(
-      "connection",
-      providerUiState("degraded", "The interview connection dropped.").message,
-    );
+    if (!startupCleanup)
+      setBanner(
+        "connection",
+        providerUiState("degraded", "The interview connection dropped.")
+          .message,
+      );
     console.warn("codetrial room_disconnected");
   });
   // The participant is needed to tell Jim from any other remote audio, so both
