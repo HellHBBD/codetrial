@@ -341,6 +341,48 @@ async fn report_still_runs_after_live_quota_exhaustion() {
     assert_eq!(remaining, MAX_REPORT_HTTP_ATTEMPTS - 1);
 }
 
+#[test]
+fn startup_failure_identifies_exhausted_rotations() {
+    for (prefix, failures, expected) in [
+        (
+            "startup-exhausted-quota",
+            [CredentialFailure::Quota, CredentialFailure::Quota],
+            "quota",
+        ),
+        (
+            "startup-exhausted-billing",
+            [CredentialFailure::Billing, CredentialFailure::Billing],
+            "billing",
+        ),
+        (
+            "startup-exhausted-mixed",
+            [CredentialFailure::Quota, CredentialFailure::Billing],
+            "billing",
+        ),
+        (
+            "startup-exhausted-refused",
+            [CredentialFailure::Invalid, CredentialFailure::Refused],
+            "unavailable",
+        ),
+    ] {
+        let first = format!("{prefix}-first");
+        let second = format!("{prefix}-second");
+        let configured = format!("{first},{second}");
+        let config = live_config(&[("GOOGLE_API_KEYS", &configured)]);
+        let keys = GeminiKeys::from_config(&config);
+        for (key, failure) in [(&first, failures[0]), (&second, failures[1])] {
+            keys.failed(key, failure, ApiSurface::Live);
+        }
+        let error = keys.select().unwrap_err();
+        assert_eq!(credential_failure(&error), None);
+        assert_eq!(startup_failure_reason(&error), expected, "{prefix}");
+    }
+    assert_eq!(
+        startup_failure_reason(&io::Error::other("1011 Internal error")),
+        "unavailable"
+    );
+}
+
 #[tokio::test]
 async fn report_failover_reuses_the_existing_call_budget() {
     let (result, seen, remaining) =

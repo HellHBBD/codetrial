@@ -481,9 +481,13 @@ async fn open_cold_session(
     restarts: &mut usize,
     room: Option<&Room>,
 ) -> Result<GeminiLiveSession, Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = room.is_none().then(|| {
+        tokio::time::Instant::from_std(interview.started_at) + crate::gemini::FIRST_OPEN_LIMIT
+    });
     retry_cold_open(
         interview.keys,
         restarts,
+        deadline,
         || live_session_with_keys(interview.keys, interview.boot, None),
         async |notice| {
             let Some(room) = room else { return };
@@ -507,6 +511,7 @@ async fn open_cold_session(
 async fn retry_cold_open<F, Fut, N, NFut>(
     keys: &GeminiKeys,
     restarts: &mut usize,
+    deadline: Option<tokio::time::Instant>,
     mut open: F,
     mut notify: N,
 ) -> Result<GeminiLiveSession, Box<dyn std::error::Error + Send + Sync>>
@@ -529,6 +534,18 @@ where
         });
         let (reason, until) = match opened {
             Ok(session) => return Ok(session),
+
+            // A known cooldown that cannot fit the first-open budget cannot
+            // recover here. Preserve its cause rather than letting the outer
+            // timeout replace it with an unexplained transport failure.
+            Err(error)
+                if crate::gemini::exhausted_until(error.as_ref()).is_some_and(|until| {
+                    deadline
+                        .is_some_and(|deadline| tokio::time::Instant::from_std(until) >= deadline)
+                }) =>
+            {
+                return Err(error);
+            }
 
             // Every key is out on quota. A sole key would ride out the same
             // rate limit under this budget, so a rotation waits too.

@@ -778,6 +778,12 @@ pub(crate) fn is_billing_failure(error: &(dyn std::error::Error + 'static)) -> b
 /// Machine-owned reasons only; silence and an internal provider error do not
 /// identify quota or billing. The browser uses these on interviewer_state.
 pub(crate) fn startup_failure_reason(error: &(dyn std::error::Error + 'static)) -> &'static str {
+    if credentials::exhausted_by_billing(error) {
+        return "billing";
+    }
+    if credentials::exhausted_until(error).is_some() {
+        return "quota";
+    }
     match credential_failure(error) {
         Some(CredentialFailure::Quota) => "quota",
         Some(CredentialFailure::Billing) => "billing",

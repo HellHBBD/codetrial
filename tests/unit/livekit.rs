@@ -657,6 +657,7 @@ async fn startup_open_failover_does_not_repeat_the_readiness_generation() {
             retry_cold_open(
                 &keys,
                 &mut restarts,
+                Some(tokio::time::Instant::now() + crate::gemini::FIRST_OPEN_LIMIT),
                 || crate::gemini::live_session_with_keys_at(&url, &keys, &boot, None),
                 |_| async {},
             ),
@@ -2049,6 +2050,7 @@ async fn first_cold_open_retries_a_503_on_the_selected_key() {
         let session = retry_cold_open(
             &keys,
             &mut restarts,
+            None,
             || crate::gemini::live_session_with_keys_at(&url, &keys, &boot, None),
             |notice| {
                 // A room slow to take the estimate must not stretch the wait it
@@ -2134,6 +2136,7 @@ async fn a_sole_key_rate_limit_is_announced_as_quota() {
         retry_cold_open(
             &keys,
             &mut 0,
+            None,
             || crate::gemini::live_session_with_keys_at(&url, &keys, &boot, None),
             |notice| {
                 notices.push(notice);
@@ -2206,6 +2209,7 @@ async fn a_first_open_gives_up_at_its_time_limit() {
         retry_cold_open(
             &keys,
             &mut 0,
+            None,
             || crate::gemini::live_session_with_keys_at(&url, &keys, &boot, None),
             |_| async {},
         ),
@@ -2217,6 +2221,79 @@ async fn a_first_open_gives_up_at_its_time_limit() {
     assert!(error.to_string().contains("did not open within"), "{error}");
     assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(started.elapsed() < COLD_OPEN_BACKOFF);
+}
+
+#[tokio::test]
+#[allow(clippy::result_large_err)]
+async fn startup_open_preserves_quota_when_cooldown_outlasts_its_budget() {
+    use tokio_tungstenite::tungstenite::handshake::server;
+
+    let config = load_from_pairs([
+        ("LIVEKIT_URL", "wss://example.livekit.cloud"),
+        ("LIVEKIT_API_KEY", "devkey"),
+        ("LIVEKIT_API_SECRET", "devsecret"),
+        ("GOOGLE_API_KEYS", "startup-cooled-a,startup-cooled-b"),
+    ])
+    .unwrap();
+    let keys = GeminiKeys::from_config(&config);
+    let boot = crate::runtime::bootstrap(&config, "interview-fixed", Some("two-sum"), 45);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = tokio_tungstenite::accept_hdr_async(
+                socket,
+                |_: &server::Request, _: server::Response| {
+                    let mut refusal = server::ErrorResponse::new(None);
+                    *refusal.status_mut() = axum::http::StatusCode::TOO_MANY_REQUESTS;
+                    Err(refusal)
+                },
+            )
+            .await;
+        }
+    });
+    for _ in 0..2 {
+        assert!(
+            crate::gemini::live_session_with_keys_at(&url, &keys, &boot, None)
+                .await
+                .is_err()
+        );
+    }
+    server.await.unwrap();
+
+    let mut restarts = 0;
+    let mut attempts = 0;
+    let mut notices = Vec::new();
+    let limit = COLD_OPEN_BACKOFF / 4;
+    let error = crate::gemini::first_open_within(
+        limit,
+        retry_cold_open(
+            &keys,
+            &mut restarts,
+            Some(tokio::time::Instant::now() + limit),
+            || {
+                attempts += 1;
+                let error = keys.select().unwrap_err();
+                async move { Err(error.into()) }
+            },
+            |notice| {
+                notices.push(notice);
+                async {}
+            },
+        ),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(
+        crate::gemini::startup_failure_reason(error.as_ref()),
+        "quota"
+    );
+    assert!(crate::gemini::exhausted_until(error.as_ref()).is_some());
+    assert_eq!(attempts, 1);
+    assert_eq!(restarts, 0);
+    assert!(notices.is_empty());
 }
 
 /// Every key's project out of credit: the rotation tries each once and then
@@ -2258,6 +2335,7 @@ async fn a_rotation_emptied_by_billing_failures_reports_billing() {
     let error = retry_cold_open(
         &keys,
         &mut 0,
+        None,
         || {
             attempts += 1;
             crate::gemini::live_session_with_keys_at(&url, &keys, &boot, None)
@@ -2351,6 +2429,7 @@ async fn an_exhausted_rotation_waits_only_for_a_key_out_on_quota() {
             retry_cold_open(
                 &keys,
                 &mut restarts,
+                None,
                 || {
                     attempts += 1;
                     let error = keys.select().unwrap_err();
